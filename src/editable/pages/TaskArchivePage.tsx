@@ -5,8 +5,9 @@ import { buildTaskMetadata } from '@/lib/seo'
 import { CATEGORY_OPTIONS, normalizeCategory } from '@/lib/categories'
 import { fetchPaginatedTaskPosts, buildPostUrl } from '@/lib/task-data'
 import { getTaskConfig, SITE_CONFIG, type TaskKey } from '@/lib/site-config'
-import type { SiteFeedPagination, SitePost } from '@/lib/site-connector'
+import { fetchSiteFeed, type SiteFeedPagination, type SitePost } from '@/lib/site-connector'
 import { taskPageMetadata } from '@/config/site.content'
+import { mediaDistributionRoute } from '@/config/media-distribution-route'
 import { taskPageVoices } from '@/editable/content/task-pages.content'
 import { EditableSiteShell } from '@/editable/shell/EditableSiteShell'
 import { getVisualPreset, visualSystem } from '@/editable/theme/visual-system'
@@ -37,6 +38,7 @@ const placeholder = '/placeholder.svg?height=900&width=1200'
 const getImage = (post: SitePost) => getImages(post)[0] || placeholder
 const getCategory = (post: SitePost, fallback: string) => asText(getContent(post).category) || post.tags?.[0] || fallback
 const getSummary = (post: SitePost) => post.summary || asText(getContent(post).description) || asText(getContent(post).excerpt) || asText(getContent(post).body)
+const getPostType = (post: SitePost) => asText(getContent(post).type).toLowerCase()
 const getField = (post: SitePost, keys: string[]) => {
   const content = getContent(post)
   for (const key of keys) {
@@ -44,6 +46,71 @@ const getField = (post: SitePost, keys: string[]) => {
     if (value) return value
   }
   return ''
+}
+
+const isPublishedPost = (post: SitePost) => {
+  const status = typeof (post as any).status === 'string' ? String((post as any).status).toUpperCase() : ''
+  return !status || status === 'PUBLISHED'
+}
+
+const isMediaDistributionPost = (post: SitePost) => {
+  const type = getPostType(post)
+  if (type === 'comment') return false
+  if (['mediadistribution', 'media-distribution', 'media_distribution'].includes(type)) return true
+  const configuredType = SITE_CONFIG.tasks.find((item) => item.key === 'mediaDistribution')?.contentType?.toLowerCase()
+  if (configuredType && type === configuredType) return true
+  const tags = Array.isArray(post.tags) ? post.tags.map((tag) => String(tag).toLowerCase()) : []
+  return tags.some((tag) => ['mediadistribution', 'media-distribution', 'media_distribution', 'media', 'press', 'press-release', 'news'].includes(tag))
+}
+
+const paginateRealPosts = (posts: SitePost[], page: number, limit: number): { posts: SitePost[]; pagination: SiteFeedPagination } => {
+  const total = posts.length
+  const totalPages = Math.max(1, Math.ceil(total / limit))
+  const start = (page - 1) * limit
+  return {
+    posts: posts.slice(start, start + limit),
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages,
+      hasPrevPage: page > 1,
+      hasNextPage: page < totalPages,
+    },
+  }
+}
+
+async function fetchEditableRealMediaPosts({ page, limit, category }: { page: number; limit: number; category: string }) {
+  const normalizedCategory = category === 'all' ? '' : normalizeCategory(category)
+  const configuredType = SITE_CONFIG.tasks.find((item) => item.key === 'mediaDistribution')?.contentType
+  const attempts = [
+    configuredType,
+    'mediaDistribution',
+    mediaDistributionRoute.replace(/^\//, ''),
+    '',
+  ].filter((value, index, list): value is string => typeof value === 'string' && list.indexOf(value) === index)
+
+  const seen = new Map<string, SitePost>()
+  for (const taskAlias of attempts) {
+    const feed = await fetchSiteFeed<SitePost>(1000, {
+      fresh: true,
+      timeoutMs: 5000,
+      ...(taskAlias ? { task: taskAlias } : {}),
+      ...(normalizedCategory ? { category: normalizedCategory } : {}),
+    }).catch(() => null)
+
+    for (const post of feed?.posts || []) {
+      if (!isPublishedPost(post) || getPostType(post) === 'comment') continue
+      const rawCategory = getCategory(post, '')
+      if (normalizedCategory && normalizeCategory(rawCategory) !== normalizedCategory) continue
+      if (taskAlias || isMediaDistributionPost(post) || SITE_CONFIG.tasks.filter((item) => item.enabled).length === 1) {
+        seen.set(post.slug || post.id || post.title, post)
+      }
+    }
+    if (seen.size) break
+  }
+
+  return paginateRealPosts(Array.from(seen.values()), page, limit)
 }
 
 function pageHref(basePath: string, category: string, page: number) {
@@ -78,7 +145,12 @@ export async function EditableTaskArchiveRoute({
   const page = Math.max(1, Math.floor(Number(resolved.page) || 1))
   const category = resolved.category ? normalizeCategory(resolved.category) : 'all'
   const taskConfig = getTaskConfig(task)
-  const { posts, pagination } = await fetchPaginatedTaskPosts(task, { page, limit: 24, category })
+  let { posts, pagination } = await fetchPaginatedTaskPosts(task, { page, limit: 24, category, fresh: true })
+  if (task === 'mediaDistribution' && !posts.length) {
+    const recovered = await fetchEditableRealMediaPosts({ page, limit: 24, category })
+    posts = recovered.posts
+    pagination = recovered.pagination
+  }
   return <TaskArchiveView task={task} posts={posts} pagination={pagination} category={category} basePath={basePath || taskConfig?.route || `/${task}`} />
 }
 
@@ -182,109 +254,110 @@ function EditorialArchive({
   label: string
 }) {
   const page = pagination.page || 1
-  const lead = posts[0]
-  const secondary = posts.slice(1, 3)
-  const remaining = posts.slice(3)
+  const latest = posts.slice(0, 3)
+  const services = ['Press Release Routing', 'Newswire Pickup', 'Campaign Syndication', 'Brand Announcements', 'Public Relations', 'Coverage Tracking']
 
   return (
     <EditableSiteShell>
-      <main className="min-h-screen bg-[#f7f4ef] text-[#111]">
-        <section className="border-b border-black bg-white">
-          <div className="mx-auto flex max-w-[var(--editable-container)] flex-col gap-6 px-4 py-10 sm:px-6 lg:flex-row lg:items-end lg:justify-between lg:px-8 lg:py-14">
+      <main className="min-h-screen bg-white text-[var(--slot4-page-text)]">
+        <section className="relative min-h-[430px] overflow-hidden bg-[var(--slot4-dark-bg)] text-white">
+          <img src="https://images.unsplash.com/photo-1494412651409-8963ce7935a7?auto=format&fit=crop&w=1800&q=80" alt="" className="absolute inset-0 h-full w-full object-cover opacity-55" />
+          <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(25,56,69,.95),rgba(25,56,69,.55))]" />
+          <div className="relative mx-auto flex min-h-[430px] max-w-[1280px] items-center px-4 py-16 sm:px-6 lg:px-8">
             <div>
-              <p className="text-xs font-black uppercase tracking-[0.28em] text-[#c92f2f]">The newsroom</p>
-              <h1 className="editorial-brand mt-3 text-6xl font-black leading-none tracking-[-0.055em] sm:text-7xl lg:text-8xl">
+              <p className="text-xs font-black uppercase tracking-[0.28em] text-[var(--slot4-accent)]">Media distribution archive</p>
+              <h1 className="logistics-display mt-4 max-w-4xl text-6xl leading-[.92] sm:text-8xl">
                 {category === 'all' ? label : categoryLabel}
               </h1>
+              <p className="mt-5 max-w-2xl text-lg font-semibold leading-8 text-white/78">
+                Real published posts, press-ready updates, campaign notes, and public announcements organized for fast discovery.
+              </p>
             </div>
-            <p className="max-w-md border-l-4 border-[#c92f2f] pl-5 text-sm font-bold leading-7 text-black/65">
-              Timely reporting, sharp perspectives, and media-ready stories organized for fast discovery.
-            </p>
           </div>
         </section>
 
-        <section className="border-b border-black bg-[#171717] text-white">
-          <div className="mx-auto flex max-w-[var(--editable-container)] gap-7 overflow-x-auto px-4 py-4 text-xs font-black uppercase tracking-[0.16em] sm:px-6 lg:px-8">
-            <Link href={basePath} className={category === 'all' ? 'text-[#f34a43]' : 'hover:text-[#f34a43]'}>Latest</Link>
+        <section className="border-b border-black/10 bg-white">
+          <div className="mx-auto flex max-w-[1280px] gap-7 overflow-x-auto px-4 py-4 text-xs font-black uppercase tracking-[0.16em] sm:px-6 lg:px-8">
+            <Link href={basePath} className={category === 'all' ? 'text-[var(--slot4-accent)]' : 'hover:text-[var(--slot4-accent)]'}>Latest</Link>
             {categories.slice(0, 8).map((item) => (
-              <Link key={item.slug} href={pageHref(basePath, item.slug, 1)} className={category === item.slug ? 'text-[#f34a43]' : 'whitespace-nowrap hover:text-[#f34a43]'}>
+              <Link key={item.slug} href={pageHref(basePath, item.slug, 1)} className={category === item.slug ? 'text-[var(--slot4-accent)]' : 'whitespace-nowrap hover:text-[var(--slot4-accent)]'}>
                 {item.name}
               </Link>
             ))}
           </div>
         </section>
 
-        {lead ? (
-          <section className="mx-auto grid max-w-[var(--editable-container)] border-x border-black bg-white lg:grid-cols-[1.75fr_0.75fr]">
-            <Link href={`${basePath}/${lead.slug}`} className="group relative min-h-[34rem] overflow-hidden border-b border-black lg:border-b-0 lg:border-r">
-              <img src={getImage(lead)} alt="" className="absolute inset-0 h-full w-full object-cover transition duration-700 group-hover:scale-[1.025]" />
-              <div className="absolute inset-0 bg-gradient-to-t from-black via-black/15 to-transparent" />
-              <div className="absolute inset-x-0 bottom-0 p-6 text-white sm:p-9">
-                <span className="bg-[#c92f2f] px-3 py-2 text-[10px] font-black uppercase tracking-[0.2em]">{getCategory(lead, label)}</span>
-                <h2 className="editorial-serif mt-5 max-w-4xl text-4xl font-black leading-[0.98] tracking-[-0.045em] sm:text-6xl">{lead.title}</h2>
-                <p className="mt-5 max-w-2xl line-clamp-2 text-sm font-semibold leading-7 text-white/80">{getSummary(lead)}</p>
-              </div>
-            </Link>
-            <div className="grid">
-              <div className="border-b border-black bg-[#c92f2f] p-6 text-white">
-                <p className="text-xs font-black uppercase tracking-[0.24em]">Top stories</p>
-                <p className="editorial-serif mt-3 text-3xl font-black leading-tight">What the newsroom is watching now.</p>
-              </div>
-              {secondary.map((post, index) => (
-                <Link key={post.id || post.slug} href={`${basePath}/${post.slug}`} className="group grid grid-cols-[7rem_1fr] border-b border-black bg-white last:border-b-0">
-                  <img src={getImage(post)} alt="" className="h-full min-h-40 w-full object-cover grayscale transition group-hover:grayscale-0" />
-                  <div className="p-5">
-                    <p className="text-[10px] font-black uppercase tracking-[0.2em] text-[#c92f2f]">0{index + 1}</p>
-                    <h3 className="editorial-serif mt-3 text-xl font-black leading-tight">{post.title}</h3>
-                  </div>
-                </Link>
-              ))}
+        <section className="mx-auto grid max-w-[1280px] gap-10 px-4 py-16 sm:px-6 lg:grid-cols-[minmax(0,1fr)_340px] lg:px-8">
+          <div>
+            <div className="mb-8 flex flex-wrap items-end justify-between gap-5">
+              <h2 className="logistics-display text-5xl leading-none sm:text-6xl">Latest posts</h2>
+              <form action={basePath} className="flex rounded-md border border-black/10 bg-white shadow-sm">
+                <select name="category" defaultValue={category} className="h-12 min-w-44 bg-transparent px-3 text-xs font-black uppercase outline-none">
+                  <option value="all">All categories</option>
+                  {categories.map((item) => <option key={item.slug} value={item.slug}>{item.name}</option>)}
+                </select>
+                <button className="h-12 rounded-r-md bg-[var(--slot4-dark-bg)] px-5 text-xs font-black uppercase tracking-[0.14em] text-white">Filter</button>
+              </form>
             </div>
-          </section>
-        ) : null}
 
-        <section className="mx-auto max-w-[var(--editable-container)] border-x border-black bg-[#f7f4ef] px-4 py-12 sm:px-6 lg:px-8 lg:py-16">
-          <div className="mb-8 flex flex-wrap items-end justify-between gap-5 border-b-4 border-black pb-4">
-            <h2 className="editorial-brand text-4xl font-black tracking-[-0.04em] sm:text-5xl">More from the desk</h2>
-            <form action={basePath} className="flex border border-black bg-white">
-              <select name="category" defaultValue={category} className="h-11 min-w-44 bg-transparent px-3 text-xs font-black uppercase outline-none">
-                <option value="all">All categories</option>
-                {categories.map((item) => <option key={item.slug} value={item.slug}>{item.name}</option>)}
-              </select>
-              <button className="h-11 bg-black px-5 text-xs font-black uppercase tracking-[0.14em] text-white">Filter</button>
-            </form>
-          </div>
-
-          {remaining.length ? (
-            <div className="grid border-l border-t border-black md:grid-cols-2 xl:grid-cols-3">
-              {remaining.map((post, index) => (
-                <Link key={post.id || post.slug} href={`${basePath}/${post.slug}`} className="group border-b border-r border-black bg-white">
-                  <div className="aspect-[16/10] overflow-hidden bg-black">
-                    <img src={getImage(post)} alt="" className="h-full w-full object-cover transition duration-500 group-hover:scale-105" />
-                  </div>
-                  <div className="p-5">
-                    <div className="flex items-center justify-between gap-4 text-[10px] font-black uppercase tracking-[0.18em] text-[#c92f2f]">
-                      <span>{getCategory(post, label)}</span><span>{String(index + 3).padStart(2, '0')}</span>
+            {posts.length ? (
+              <div className="grid gap-8">
+                {posts.map((post, index) => (
+                  <Link key={post.id || post.slug} href={`${basePath}/${post.slug}`} className="group grid gap-6 rounded-[1rem] bg-white p-4 shadow-[0_16px_45px_rgba(25,56,69,.08)] transition hover:-translate-y-1 hover:shadow-[0_18px_55px_rgba(25,56,69,.14)] md:grid-cols-[320px_1fr]">
+                    <img src={getImage(post)} alt="" className="aspect-[16/10] w-full rounded-[.75rem] object-cover" />
+                    <div className="self-center">
+                      <div className="flex flex-wrap gap-4 text-[10px] font-black uppercase tracking-[0.18em] text-[var(--slot4-accent)]">
+                        <span>{String(index + 1).padStart(2, '0')}</span>
+                        <span>{getCategory(post, label)}</span>
+                      </div>
+                      <h3 className="mt-4 text-3xl font-black leading-[1.08] tracking-[-.025em] group-hover:text-[var(--slot4-accent)]">{post.title}</h3>
+                      
+                      <span className="mt-5 inline-flex items-center gap-2 text-xs font-black uppercase tracking-[.14em]">Open media post <ArrowRight className="h-4 w-4" /></span>
                     </div>
-                    <h3 className="editorial-serif mt-4 text-2xl font-black leading-[1.05]">{post.title}</h3>
-                    <p className="mt-4 line-clamp-3 text-sm leading-6 text-black/60">{getSummary(post)}</p>
-                  </div>
-                </Link>
-              ))}
-            </div>
-          ) : !lead ? (
-            <div className="border border-dashed border-black bg-white p-12 text-center">
-              <Search className="mx-auto h-8 w-8" />
-              <h2 className="editorial-serif mt-4 text-3xl font-black">No stories found</h2>
-              <p className="mt-2 text-sm text-black/60">Try another category or publish a new newsroom story.</p>
-            </div>
-          ) : null}
+                  </Link>
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-[1rem] border border-dashed border-black/20 bg-[var(--slot4-panel-bg)] p-12 text-center">
+                <Search className="mx-auto h-8 w-8" />
+                <h2 className="mt-4 text-3xl font-black">No real posts found</h2>
+                <p className="mt-2 text-sm text-[var(--slot4-muted-text)]">Publish a media distribution post or try another category.</p>
+              </div>
+            )}
 
-          <div className="mt-10 flex items-center justify-center gap-0">
-            {pagination.hasPrevPage ? <Link href={pageHref(basePath, category, page - 1)} className="border border-black bg-white px-5 py-3 text-xs font-black uppercase">Previous</Link> : null}
-            <span className="border-y border-black bg-[#c92f2f] px-5 py-3 text-xs font-black uppercase text-white">Page {page} / {pagination.totalPages || 1}</span>
-            {pagination.hasNextPage ? <Link href={pageHref(basePath, category, page + 1)} className="border border-black bg-white px-5 py-3 text-xs font-black uppercase">Next</Link> : null}
+            <div className="mt-10 flex items-center justify-center gap-2">
+              {pagination.hasPrevPage ? <Link href={pageHref(basePath, category, page - 1)} className="rounded-md border border-black/10 bg-white px-5 py-3 text-xs font-black uppercase">Previous</Link> : null}
+              <span className="rounded-md bg-[var(--slot4-accent)] px-5 py-3 text-xs font-black uppercase text-white">Page {page} / {pagination.totalPages || 1}</span>
+              {pagination.hasNextPage ? <Link href={pageHref(basePath, category, page + 1)} className="rounded-md border border-black/10 bg-white px-5 py-3 text-xs font-black uppercase">Next</Link> : null}
+            </div>
           </div>
+
+          <aside className="space-y-10">
+            {latest.length ? (
+              <div>
+                <h3 className="flex items-center gap-4 text-lg font-black">Latest News <span className="h-px flex-1 bg-black/10" /></h3>
+                <div className="mt-5 grid gap-5">
+                  {latest.map((post) => (
+                    <Link key={post.id || post.slug} href={`${basePath}/${post.slug}`} className="grid grid-cols-[96px_1fr] gap-4">
+                      <img src={getImage(post)} alt="" className="h-24 w-24 rounded-lg object-cover" />
+                      <h4 className="text-base font-black leading-snug hover:text-[var(--slot4-accent)]">{post.title}</h4>
+                    </Link>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            <div>
+              <h3 className="flex items-center gap-4 text-lg font-black">Our Services <span className="h-px flex-1 bg-black/10" /></h3>
+              <div className="mt-5 rounded-[1rem] bg-[var(--slot4-panel-bg)] p-5">
+                {services.map((service) => (
+                  <Link key={service} href="/contact" className="flex items-center gap-3 border-b border-black/10 py-4 text-lg font-black last:border-b-0">
+                    <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-[var(--slot4-accent)] text-xs text-white">+</span>
+                    {service}
+                  </Link>
+                ))}
+              </div>
+            </div>
+          </aside>
         </section>
       </main>
     </EditableSiteShell>
